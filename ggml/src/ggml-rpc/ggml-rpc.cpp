@@ -169,6 +169,13 @@ struct rpc_msg_memset_tensor_req {
     uint8_t value;
 };
 
+// header of RPC_CMD_SET_TENSOR, followed by the tensor data
+struct rpc_msg_set_tensor_req {
+    rpc_tensor tensor;
+    uint8_t cache_flag;
+    uint64_t offset;
+};
+
 struct rpc_msg_set_tensor_hash_req {
     rpc_tensor tensor;
     uint64_t offset;
@@ -311,15 +318,20 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // No response
-static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
+// The request data can be given in two parts (input, payload) to avoid copying large payloads.
+static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, const void * payload = nullptr, size_t payload_size = 0) {
     uint8_t cmd_byte = cmd;
     if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
         return false;
     }
-    if (!sock->send_data(&input_size, sizeof(input_size))) {
+    uint64_t request_size = input_size + payload_size;
+    if (!sock->send_data(&request_size, sizeof(request_size))) {
         return false;
     }
     if (!sock->send_data(input, input_size)) {
+        return false;
+    }
+    if (payload_size > 0 && !sock->send_data(payload, payload_size)) {
         return false;
     }
     return sock->flush();
@@ -417,6 +429,9 @@ public:
     void send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
     void send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size);
     void send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
+    // send input followed by payload as one request; payload must stay valid until the request is sent
+    void send_payload(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, const void * payload, size_t payload_size);
+    void send_payload_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, const void * payload, size_t payload_size);
 
     ggml_backend_event_t event_new(ggml_backend_dev_t dev);
     void event_free(ggml_backend_event_t event);
@@ -434,6 +449,8 @@ private:
         rpc_cmd                       cmd;
         std::shared_ptr<const void>   input;
         size_t                        input_size;
+        const void                  * payload = nullptr;
+        size_t                        payload_size = 0;
         void                        * output;
         size_t                        output_size;
         std::promise<void>            completion;
@@ -496,6 +513,32 @@ void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> in
     msg->input_size = input_size;
     msg->output = output;
     msg->output_size = output_size;
+    GGML_ASSERT(queue.push(msg));
+}
+
+void rpc_dispatcher::send_payload(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, const void * payload, size_t payload_size) {
+    auto msg = std::make_shared<rpc_msg>();
+    msg->cmd = cmd;
+    msg->input = input;
+    msg->input_size = input_size;
+    msg->payload = payload;
+    msg->payload_size = payload_size;
+    msg->output = nullptr;
+    msg->output_size = 0;
+    GGML_ASSERT(queue.push(msg));
+    auto future = msg->completion.get_future();
+    future.wait();
+}
+
+void rpc_dispatcher::send_payload_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, const void * payload, size_t payload_size) {
+    auto msg = std::make_shared<rpc_msg>();
+    msg->cmd = cmd;
+    msg->input = input;
+    msg->input_size = input_size;
+    msg->payload = payload;
+    msg->payload_size = payload_size;
+    msg->output = nullptr;
+    msg->output_size = 0;
     GGML_ASSERT(queue.push(msg));
 }
 
@@ -570,7 +613,7 @@ void rpc_dispatcher::work() {
                 bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size, msg_ptr->output, msg_ptr->output_size);
                 RPC_STATUS_ASSERT(status);
             } else {
-                bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size);
+                bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size, msg_ptr->payload, msg_ptr->payload_size);
                 RPC_STATUS_ASSERT(status);
             }
         }
@@ -702,18 +745,6 @@ static void ggml_backend_rpc_buffer_memset_tensor(
     ctx->dispatcher->send(RPC_CMD_MEMSET_TENSOR, request, sizeof(*request));
 }
 
-// input serialization format: | rpc_tensor | cache_flag (1 byte) | offset (8 bytes) | data (size bytes)
-static std::shared_ptr<uint8_t> serialize_set_tensor(const rpc_tensor & rpc_tensor, uint8_t cache_flag, uint64_t offset, const void * data, size_t size, size_t & input_size) {
-    input_size = sizeof(rpc_tensor) + sizeof(cache_flag) + sizeof(offset) + size;
-    uint8_t * input = new uint8_t[input_size]();
-    uint8_t * p = input;
-    memcpy(p, &rpc_tensor, sizeof(rpc_tensor)); p += sizeof(rpc_tensor);
-    memcpy(p, &cache_flag, sizeof(cache_flag)); p += sizeof(cache_flag);
-    memcpy(p, &offset,     sizeof(offset));     p += sizeof(offset);
-    memcpy(p, data, size);
-    return std::shared_ptr<uint8_t>(input, std::default_delete<uint8_t[]>());
-}
-
 // the hash cache is meant for weights, so that a model reload can skip re-sending them.
 // compute-buffer inputs (the activations ggml_backend_sched copies between backends) must not
 // take this path, otherwise with `rpc-server -c` every ubatch above the threshold is written
@@ -740,9 +771,11 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
         // the server has no cache entry for this tensor - ask it to save one
         cache_flag = 1;
     }
-    size_t input_size;
-    auto input = serialize_set_tensor(rpc_tensor, cache_flag, offset, data, size, input_size);
-    ctx->dispatcher->send(RPC_CMD_SET_TENSOR, input, input_size);
+    auto request = std::make_shared<rpc_msg_set_tensor_req>();
+    request->tensor = rpc_tensor;
+    request->cache_flag = cache_flag;
+    request->offset = offset;
+    ctx->dispatcher->send_payload(RPC_CMD_SET_TENSOR, request, sizeof(*request), data, size);
 }
 
 static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -973,9 +1006,12 @@ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tenso
         // the server has no cache entry for this tensor - ask it to save one
         cache_flag = 1;
     }
-    size_t input_size;
-    auto input = serialize_set_tensor(rpc_tensor, cache_flag, offset, data, size, input_size);
-    ctx->dispatcher->send_async(RPC_CMD_SET_TENSOR, input, input_size);
+    // the caller must not modify data before synchronizing, so it can be sent without a copy
+    auto request = std::make_shared<rpc_msg_set_tensor_req>();
+    request->tensor = rpc_tensor;
+    request->cache_flag = cache_flag;
+    request->offset = offset;
+    ctx->dispatcher->send_payload_async(RPC_CMD_SET_TENSOR, request, sizeof(*request), data, size);
 }
 
 static void ggml_backend_rpc_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -1453,17 +1489,17 @@ static bool tensor_write_from(ggml_tensor * tensor, uint64_t offset, size_t size
 
 bool rpc_server::set_tensor(socket_ptr sock, uint64_t input_size) {
     // serialization format: | rpc_tensor | cache_flag (1 byte) | offset (8 bytes) | data (size bytes) |
-    rpc_tensor in_tensor;
-    uint8_t  cache_flag;
-    uint64_t offset;
-    const size_t header_size = sizeof(in_tensor) + sizeof(cache_flag) + sizeof(offset);
-    if (input_size < header_size) {
+    if (input_size < sizeof(rpc_msg_set_tensor_req)) {
         return false;
     }
-    if (!sock->recv_data(&in_tensor, sizeof(in_tensor)) || !sock->recv_data(&cache_flag, sizeof(cache_flag)) || !sock->recv_data(&offset, sizeof(offset))) {
+    rpc_msg_set_tensor_req request;
+    if (!sock->recv_data(&request, sizeof(request))) {
         return false;
     }
-    const size_t size = input_size - header_size;
+    const rpc_tensor & in_tensor = request.tensor;
+    const uint8_t cache_flag = request.cache_flag;
+    const uint64_t offset = request.offset;
+    const size_t size = input_size - sizeof(request);
 
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
