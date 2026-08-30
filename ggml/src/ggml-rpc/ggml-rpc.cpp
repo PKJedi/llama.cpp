@@ -121,6 +121,9 @@ const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 // so that both sides clear their caches at the same point in the message stream
 const size_t GRAPH_CACHE_MAX = 1024;
 
+// Max bytes staged in memory when a tensor payload cannot be written straight into its buffer
+const size_t SET_TENSOR_SLICE = 256 * 1024 * 1024;
+
 struct rpc_msg_hello_req {
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
 };
@@ -310,7 +313,9 @@ struct ggml_backend_rpc_buffer_context {
 // RPC helper functions
 
 // Computes FNV-1a hash of the data
-static uint64_t fnv_hash(const uint8_t * data, size_t len, uint64_t hash = 0xcbf29ce484222325ULL) {
+const uint64_t FNV_OFFSET_BASIS = 0xcbf29ce484222325ULL;
+
+static uint64_t fnv_hash(const uint8_t * data, size_t len, uint64_t hash = FNV_OFFSET_BASIS) {
     const uint64_t fnv_prime = 0x100000001b3ULL;
 
     for (size_t i = 0; i < len; ++i) {
@@ -1408,7 +1413,7 @@ public:
     bool free_buffer(const rpc_msg_free_buffer_req & request);
     bool buffer_clear(const rpc_msg_buffer_clear_req & request);
     bool memset_tensor(const rpc_msg_memset_tensor_req & request);
-    bool set_tensor(const std::vector<uint8_t> & input);
+    bool set_tensor(socket_ptr sock, uint64_t input_size);
     bool set_tensor_2d(const std::vector<uint8_t> & input);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
@@ -1430,7 +1435,6 @@ public:
 
 private:
     void sync_all_backends();
-    bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
     ggml_tensor * create_node(uint64_t id,
                               struct ggml_context * ctx,
@@ -1701,19 +1705,44 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
 }
 
 
-bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
+// fill tensor[offset, offset + size) from read(dst, n); host buffers are written in place, others via a bounded slice
+template<typename F>
+static bool tensor_write_from(ggml_tensor * tensor, uint64_t offset, size_t size, F && read) {
+    const bool is_host = ggml_backend_buffer_is_host(tensor->buffer);
+    std::vector<uint8_t> slice;
+    if (!is_host) {
+        slice.resize(std::min(size, SET_TENSOR_SLICE));
+    }
+    for (size_t done = 0; done < size;) {
+        const size_t n = std::min(size - done, SET_TENSOR_SLICE);
+        uint8_t * dst = is_host ? (uint8_t *) tensor->data + offset + done : slice.data();
+        if (!read(dst, n)) {
+            return false;
+        }
+        if (!is_host) {
+            ggml_backend_tensor_set(tensor, dst, offset + done, n);
+        }
+        done += n;
+    }
+    return true;
+}
+
+bool rpc_server::set_tensor(socket_ptr sock, uint64_t input_size) {
     sync_all_backends();
     // serialization format: | rpc_tensor | cache_flag (1 byte) | offset (8 bytes) | data (size bytes) |
+    // the header is validated before the payload is received straight into the buffer
+    rpc_tensor in_tensor_buf;
     uint8_t  cache_flag;
     uint64_t offset;
     const size_t header_size = sizeof(rpc_tensor) + sizeof(cache_flag) + sizeof(offset);
-    if (input.size() < header_size) {
+    if (input_size < header_size) {
         return false;
     }
-    const rpc_tensor * in_tensor = (const rpc_tensor *)input.data();
-    memcpy(&cache_flag, input.data() + sizeof(rpc_tensor), sizeof(cache_flag));
-    memcpy(&offset,     input.data() + sizeof(rpc_tensor) + sizeof(cache_flag), sizeof(offset));
-    const size_t size = input.size() - header_size;
+    if (!sock->recv_data(&in_tensor_buf, sizeof(in_tensor_buf)) || !sock->recv_data(&cache_flag, sizeof(cache_flag)) || !sock->recv_data(&offset, sizeof(offset))) {
+        return false;
+    }
+    const rpc_tensor * in_tensor = &in_tensor_buf;
+    const size_t size = input_size - header_size;
 
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
@@ -1744,19 +1773,39 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         }
     }
 
-    const void * data = input.data() + header_size;
-    if (cache_dir && cache_flag) {
-        uint64_t hash = fnv_hash((const uint8_t*)data, size);
-        char hash_str[17];
-        snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
-        // save to cache_dir/hash_str
-        fs::path cache_file = fs::path(cache_dir) / hash_str;
-        std::ofstream ofs(cache_file, std::ios::binary);
-        ofs.write((const char *)data, size);
-        LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
+    // the cache file is named by the hash of the full payload, so write to a temporary name while receiving
+    const bool cache = cache_dir && cache_flag;
+    fs::path tmp_file;
+    std::ofstream ofs;
+    uint64_t hash = FNV_OFFSET_BASIS;
+    if (cache) {
+        tmp_file = fs::path(cache_dir) / ("tmp-" + std::to_string((uintptr_t) this));
+        ofs.open(tmp_file, std::ios::binary);
     }
-    ggml_backend_tensor_set(tensor, data, offset, size);
-    return true;
+    bool ok = tensor_write_from(tensor, offset, size, [&](uint8_t * dst, size_t n) {
+        if (!sock->recv_data(dst, n)) {
+            return false;
+        }
+        if (cache) {
+            hash = fnv_hash(dst, n, hash);
+            ofs.write((const char *) dst, n);
+        }
+        return true;
+    });
+    if (cache) {
+        ofs.close();
+        std::error_code ec;
+        if (ok) {
+            char hash_str[17];
+            snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
+            fs::path cache_file = fs::path(cache_dir) / hash_str;
+            fs::rename(tmp_file, cache_file, ec);
+            LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
+        } else {
+            fs::remove(tmp_file, ec);
+        }
+    }
+    return ok;
 }
 
 bool rpc_server::set_tensor_2d(const std::vector<uint8_t> & input) {
@@ -1821,26 +1870,6 @@ bool rpc_server::set_tensor_2d(const std::vector<uint8_t> & input) {
     return true;
 }
 
-bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
-    if (!cache_dir) {
-        return false;
-    }
-    char hash_str[17];
-    snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
-    fs::path cache_file = fs::path(cache_dir) / hash_str;
-    std::error_code ec;
-    if (!fs::exists(cache_file, ec)) {
-        return false;
-    }
-    std::ifstream ifs(cache_file, std::ios::binary);
-    ifs.seekg(0, std::ios::end);
-    size_t size = ifs.tellg();
-    ifs.seekg(0, std::ios::beg);
-    data.resize(size);
-    ifs.read((char *)data.data(), size);
-    return true;
-}
-
 bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response)
 {
     sync_all_backends();
@@ -1858,14 +1887,29 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
         return false;
     }
 
-    std::vector<uint8_t> cached_file;
-    if (!get_cached_file(request.hash, cached_file)) {
+    // the cached file is streamed into the buffer instead of being read into memory first
+    response.result = 0;
+    fs::path cache_file;
+    size_t size = 0;
+    if (cache_dir) {
+        char hash_str[17];
+        snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, request.hash);
+        cache_file = fs::path(cache_dir) / hash_str;
+        std::error_code ec;
+        if (fs::exists(cache_file, ec)) {
+            size = fs::file_size(cache_file, ec);
+            if (ec) {
+                cache_file.clear();
+            }
+        } else {
+            cache_file.clear();
+        }
+    }
+    if (cache_file.empty()) {
         LOG_DBG2("[%s] tensor: %s, offset: %" PRIu64 ", hash: 0x%" PRIx64 ", cache miss\n",
                 __func__, rpc_log_format_tensor(tensor).c_str(), request.offset, request.hash);
-        response.result = 0;
         return true;
     }
-    size_t size = cached_file.size();
     LOG_DBG2("[%s] tensor: %s, buffer: %p, data: %p, offset: %" PRIu64 ", size: %s, hash: 0x%" PRIx64 ", cache hit\n",
             __func__, rpc_log_format_tensor(tensor).c_str(), (void*)tensor->buffer, tensor->data, request.offset,
             rpc_log_format_size(size).c_str(), request.hash);
@@ -1883,7 +1927,13 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
             return false;
         }
     }
-    ggml_backend_tensor_set(tensor, cached_file.data(), request.offset, size);
+    std::ifstream ifs(cache_file, std::ios::binary);
+    if (!tensor_write_from(tensor, request.offset, size, [&](uint8_t * dst, size_t n) {
+        return (bool) ifs.read((char *) dst, n);
+    })) {
+        LOG_ERROR("[%s] failed to read '%s'\n", __func__, cache_file.string().c_str());
+        return false;
+    }
     response.result = 1;
     return true;
 }
@@ -2604,11 +2654,11 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 break;
             }
             case RPC_CMD_SET_TENSOR: {
-                std::vector<uint8_t> input;
-                if (!recv_msg(sock, input)) {
+                uint64_t input_size;
+                if (!sock->recv_data(&input_size, sizeof(input_size))) {
                     return;
                 }
-                if (!server.set_tensor(input)) {
+                if (!server.set_tensor(sock, input_size)) {
                     return;
                 }
                 break;
