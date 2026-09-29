@@ -1724,10 +1724,26 @@ bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_co
         return false;
     }
 
+    if (src_size > (uint64_t) ggml_nbytes(dst)) {
+        GGML_LOG_ERROR("[%s] src size %" PRIu64 " exceeds dst size %zu\n", __func__, src_size, ggml_nbytes(dst));
+        return false;
+    }
+
     LOG_DBG("[%s] src->buffer: %p, dst->buffer: %p\n",
             __func__, (void*) src->buffer, (void*) dst->buffer);
 
-    response.result = ggml_backend_buffer_copy_tensor(src, dst);
+    // buffer cpy_tensor usually handles only its own buffer type (e.g. not CUDA <-> CPU),
+    // copy here instead so that the client does not have to go through get/set_tensor
+    if (ggml_backend_buffer_is_host(src->buffer)) {
+        ggml_backend_tensor_set(dst, src->data, 0, src_size);
+    } else if (ggml_backend_buffer_is_host(dst->buffer)) {
+        ggml_backend_tensor_get(src, dst->data, 0, src_size);
+    } else if (!ggml_backend_buffer_copy_tensor(src, dst)) {
+        std::vector<uint8_t> staging(src_size);
+        ggml_backend_tensor_get(src, staging.data(), 0, src_size);
+        ggml_backend_tensor_set(dst, staging.data(), 0, src_size);
+    }
+    response.result = 1;
     return true;
 }
 
