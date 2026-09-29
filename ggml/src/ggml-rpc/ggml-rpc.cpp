@@ -78,6 +78,7 @@ enum rpc_cmd {
     RPC_CMD_COMM_INIT,
     RPC_CMD_COMM_ALLREDUCE,
     RPC_CMD_COMM_FREE,
+    RPC_CMD_COPY_TENSOR_ASYNC,
     RPC_CMD_NONE,
     RPC_CMD_COUNT,
 };
@@ -109,6 +110,7 @@ static const char * rpc_cmd_name(enum rpc_cmd cmd) {
         case RPC_CMD_COMM_INIT:         return "COMM_INIT";
         case RPC_CMD_COMM_ALLREDUCE:    return "COMM_ALLREDUCE";
         case RPC_CMD_COMM_FREE:         return "COMM_FREE";
+        case RPC_CMD_COPY_TENSOR_ASYNC: return "COPY_TENSOR_ASYNC";
         case RPC_CMD_NONE:              return "NONE";
         default:                        return "UNKNOWN";
     }
@@ -1225,6 +1227,27 @@ static void ggml_backend_rpc_get_tensor_async(ggml_backend_t backend, const ggml
     ctx->dispatcher->send_async(RPC_CMD_GET_TENSOR, request, sizeof(*request), data, size);
 }
 
+static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+    if (!ggml_backend_is_rpc(backend_src) || !ggml_backend_buffer_is_rpc(src->buffer) || !ggml_backend_buffer_is_rpc(dst->buffer)) {
+        return false;
+    }
+    ggml_backend_rpc_context * ctx = (ggml_backend_rpc_context *)backend_dst->context;
+    ggml_backend_rpc_context * src_ctx = (ggml_backend_rpc_context *)backend_src->context;
+    ggml_backend_rpc_buffer_context * src_buf_ctx = (ggml_backend_rpc_buffer_context *)src->buffer->context;
+    ggml_backend_rpc_buffer_context * dst_buf_ctx = (ggml_backend_rpc_buffer_context *)dst->buffer->context;
+    if (src_ctx->dispatcher != ctx->dispatcher || src_buf_ctx->dispatcher != ctx->dispatcher || dst_buf_ctx->dispatcher != ctx->dispatcher) {
+        return false;
+    }
+    LOG_DBG2("[%s] src: %s -> dst: %s\n", __func__, rpc_log_format_tensor(src).c_str(), rpc_log_format_tensor(dst).c_str());
+    // the server processes the commands of a connection in order, so the copy runs after
+    // the pending work of backend_src and before the next work of backend_dst without a reply
+    auto request = std::make_shared<rpc_msg_copy_tensor_req>();
+    request->src = serialize_tensor(src);
+    request->dst = serialize_tensor(dst);
+    ctx->dispatcher->send_async(RPC_CMD_COPY_TENSOR_ASYNC, request, sizeof(*request));
+    return true;
+}
+
 static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
     rpc_ctx->dispatcher->synchronize();
@@ -1344,7 +1367,7 @@ static ggml_backend_i ggml_backend_rpc_interface = {
     /* .get_tensor_async        = */ ggml_backend_rpc_get_tensor_async,
     /* .set_tensor_2d_async     = */ ggml_backend_rpc_set_tensor_2d_async,
     /* .get_tensor_2d_async     = */ ggml_backend_rpc_get_tensor_2d_async,
-    /* .cpy_tensor_async        = */ NULL,
+    /* .cpy_tensor_async        = */ ggml_backend_rpc_cpy_tensor_async,
     /* .synchronize             = */ ggml_backend_rpc_synchronize,
     /* .graph_plan_create       = */ NULL,
     /* .graph_plan_free         = */ NULL,
@@ -1448,7 +1471,7 @@ public:
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool get_tensor_2d(const rpc_msg_get_tensor_2d_req & request, std::vector<uint8_t> & response);
-    bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
+    bool copy_tensor(const rpc_msg_copy_tensor_req & request);
     bool graph_compute(const std::vector<uint8_t> & input);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
     bool comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_init_rsp & response);
@@ -2091,7 +2114,7 @@ bool rpc_server::get_tensor_2d(const rpc_msg_get_tensor_2d_req & request, std::v
     return true;
 }
 
-bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response) {
+bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request) {
     sync_all_backends();
     struct ggml_init_params params {
         /*.mem_size   =*/ 2*ggml_tensor_overhead(),
@@ -2144,7 +2167,6 @@ bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_co
         ggml_backend_tensor_get(src, staging.data(), 0, src_size);
         ggml_backend_tensor_set(dst, staging.data(), 0, src_size);
     }
-    response.result = 1;
     return true;
 }
 
@@ -2775,11 +2797,22 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
-                rpc_msg_copy_tensor_rsp response;
-                if (!server.copy_tensor(request, response)) {
+                if (!server.copy_tensor(request)) {
                     return;
                 }
+                rpc_msg_copy_tensor_rsp response;
+                response.result = 1;
                 if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_COPY_TENSOR_ASYNC: {
+                rpc_msg_copy_tensor_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                if (!server.copy_tensor(request)) {
                     return;
                 }
                 break;
