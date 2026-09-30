@@ -563,6 +563,10 @@ struct llama_mmap::impl {
         mapped_fragments = std::move(new_mapped_fragments);
     }
 
+    void drop_fragment(size_t first, size_t last) {
+        unmap_fragment(first, last);
+    }
+
     ~impl() {
         for (const auto & frag : mapped_fragments) {
             if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
@@ -627,6 +631,22 @@ struct llama_mmap::impl {
         GGML_UNUSED(last);
     }
 
+    void drop_fragment(size_t first, size_t last) {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        const size_t page_size = si.dwPageSize;
+        first = (first + page_size - 1) & ~(page_size - 1);
+        last  = last & ~(page_size - 1);
+        if (last <= first) {
+            return;
+        }
+        // for pages that are not locked, VirtualUnlock removes them from the working set
+        // and fails with ERROR_NOT_LOCKED; the view stays valid
+        if (!VirtualUnlock((char *) addr + first, last - first) && GetLastError() != ERROR_NOT_LOCKED) {
+            LLAMA_LOG_WARN("warning: VirtualUnlock failed: %s\n", llama_format_win_err(GetLastError()).c_str());
+        }
+    }
+
     ~impl() {
         if (hMapping) {
             if (addr) {
@@ -657,6 +677,10 @@ struct llama_mmap::impl {
 
         throw std::runtime_error("mmap not supported");
     }
+
+    void drop_fragment(size_t first, size_t last) {
+        unmap_fragment(first, last);
+    }
 #endif
 
     void * addr;
@@ -671,6 +695,7 @@ size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
+void llama_mmap::drop_fragment(size_t first, size_t last) { pimpl->drop_fragment(first, last); }
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;

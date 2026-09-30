@@ -55,6 +55,10 @@ struct llama_mmap {
 
     void unmap_fragment(size_t first, size_t last);
 
+    // release the pages of a range that will not be read again
+    // unmaps it where possible, on Windows (no partial unmap) removes it from the working set
+    void drop_fragment(size_t first, size_t last);
+
     static const bool SUPPORTED;
 
 private:

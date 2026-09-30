@@ -1716,7 +1716,7 @@ bool llama_model_loader::load_all_data(
                     return lr.first < last && first < lr.second;
                 });
                 if (--stream_reads[ggml_get_name(cur)] == 0 && !lazy_overlap) {
-                    mappings.at(weight->idx)->unmap_fragment(first, last);
+                    mappings.at(weight->idx)->drop_fragment(first, last);
                 } else if (!lazy_overlap) {
                     mmaps_streamed.at(weight->idx).emplace_back(first, last);
                 }
@@ -1844,7 +1844,7 @@ bool llama_model_loader::load_all_data(
             // duplicates that were not all read from the mapping
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {
                 for (const auto & range : mmaps_streamed.at(idx)) {
-                    mappings.at(idx)->unmap_fragment(range.first, range.second);
+                    mappings.at(idx)->drop_fragment(range.first, range.second);
                 }
             }
             LLAMA_LOG_INFO("%s: read %zu tensors (%.2f MiB) for non-host buffers from mmap\n",
