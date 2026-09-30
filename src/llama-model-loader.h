@@ -140,6 +140,13 @@ struct llama_model_loader {
     size_t size_data = 0;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
 
+    // without mmap, tensors in non-host buffers are read from a mapping instead of a staging buffer of their size
+    bool stream_non_host = false;
+    std::unordered_map<std::string, int> stream_reads; // tensors in non-host buffers per weight, duplicates read it again
+    std::vector<llama_mmap::ranges> mmaps_streamed;    // ranges that could not be unmapped yet
+    size_t n_streamed    = 0;
+    size_t size_streamed = 0;
+
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
         bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {

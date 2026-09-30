@@ -1408,10 +1408,28 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
 }
 
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
+    // the mapping is only a read source here, the tensors stay in their own buffers
+    stream_non_host = !use_mmap && !use_direct_io && !no_alloc && llama_mmap::SUPPORTED &&
+        std::any_of(ctx_map.begin(), ctx_map.end(), [](const auto & it) {
+            return !ggml_backend_buft_is_host(it.first.buft) && ggml_get_first_tensor(it.second.get()) != nullptr;
+        });
+
+    if (stream_non_host) {
+        for (const auto & [key, ctx] : ctx_map) {
+            if (ggml_backend_buft_is_host(key.buft)) {
+                continue;
+            }
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t; t = ggml_get_next_tensor(ctx.get(), t)) {
+                stream_reads[ggml_get_name(t)]++;
+            }
+        }
+    }
+
     // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
-    if (use_mmap || lazy.any()) {
+    if (use_mmap || lazy.any() || stream_non_host) {
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
+        mmaps_streamed.resize(files.size());
         for (uint32_t idx = 0; idx < files.size(); idx++) {
             const auto & file = files[idx];
 
@@ -1428,10 +1446,23 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
             const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
 
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
-                    lazy.for_file(idx));
+            std::unique_ptr<llama_mmap> mapping;
+            try {
+                mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa, lazy.for_file(idx));
+            } catch (const std::exception & e) {
+                if (use_mmap || lazy.any()) {
+                    throw;
+                }
+                LLAMA_LOG_WARN("%s: failed to map model file %u, staging tensors for non-host buffers instead: %s\n",
+                        __func__, idx, e.what());
+                mappings.clear();
+                mmaps_used.clear();
+                mmaps_streamed.clear();
+                stream_non_host = false;
+                break;
+            }
             mmaps_used.emplace_back(mapping->size(), 0);
-            if (mlock_mmaps) {
+            if (mlock_mmaps && (use_mmap || lazy.any())) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
                 mlock_mmap->init(mapping->addr());
                 mlock_mmaps->emplace_back(std::move(mlock_mmap));
@@ -1637,7 +1668,9 @@ bool llama_model_loader::load_all_data(
 
         size_t n_size = ggml_nbytes(cur);
 
-        const bool from_mapping = use_mmap || lazy.has(cur);
+        // without an async upload path, reading from the mapping avoids a staging buffer of the tensor's size
+        const bool streamed = stream_non_host && !upload_backend && !lazy.has(cur) && !ggml_backend_buffer_is_host(cur->buffer);
+        const bool from_mapping = use_mmap || lazy.has(cur) || streamed;
 
         if (from_mapping) {
             const auto & mapping = mappings.at(weight->idx);
@@ -1647,7 +1680,7 @@ bool llama_model_loader::load_all_data(
             }
             uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
 
-            if (check_tensors) {
+            if (check_tensors && !streamed) {
                 validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
                     return std::make_pair(cur, ggml_validate_row_data(cur->type, data, n_size));
                 }));
@@ -1668,6 +1701,27 @@ bool llama_model_loader::load_all_data(
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
+            }
+            if (streamed) {
+                // validated here like a staged tensor, so that the range can be unmapped right away
+                if (check_tensors && !ggml_validate_row_data(cur->type, data, n_size)) {
+                    throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                }
+                // a duplicated tensor reads the same range again, unmap after the last one;
+                // lazy tensors keep reading from the mapping
+                const size_t first = weight->offs;
+                const size_t last  = weight->offs + n_size;
+                const auto & lazy_ranges = lazy.for_file(weight->idx);
+                const bool lazy_overlap = std::any_of(lazy_ranges.begin(), lazy_ranges.end(), [&](const auto & lr) {
+                    return lr.first < last && first < lr.second;
+                });
+                if (--stream_reads[ggml_get_name(cur)] == 0 && !lazy_overlap) {
+                    mappings.at(weight->idx)->unmap_fragment(first, last);
+                } else if (!lazy_overlap) {
+                    mmaps_streamed.at(weight->idx).emplace_back(first, last);
+                }
+                n_streamed++;
+                size_streamed += n_size;
             }
         } else {
             const auto & file = files.at(weight->idx);
@@ -1785,6 +1839,16 @@ bool llama_model_loader::load_all_data(
                     mapping->unmap_fragment(mmap_used.second, mapping->size());
                 }
             }
+        }
+        if (stream_non_host) {
+            // duplicates that were not all read from the mapping
+            for (uint32_t idx = 0; idx < mappings.size(); idx++) {
+                for (const auto & range : mmaps_streamed.at(idx)) {
+                    mappings.at(idx)->unmap_fragment(range.first, range.second);
+                }
+            }
+            LLAMA_LOG_INFO("%s: read %zu tensors (%.2f MiB) for non-host buffers from mmap\n",
+                    __func__, n_streamed, size_streamed / 1024.0 / 1024.0);
         }
         if (progress_callback) {
             // Even though the model is done loading, we still honor

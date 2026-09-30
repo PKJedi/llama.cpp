@@ -1951,7 +1951,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    if (use_mmap_buffer) {
+    // mappings made only to read tensors for non-host buffers are not needed after loading
+    if (use_mmap_buffer && (ml.use_mmap || ml.lazy.any())) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
