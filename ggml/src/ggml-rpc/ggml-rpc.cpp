@@ -531,6 +531,7 @@ public:
     void busy_spin_acquire();
     void busy_spin_release();
     void graph_compute(uint32_t device, const ggml_cgraph * cgraph);
+    void free_buffer(uint64_t remote_ptr);
 
     void start(const std::string & endpoint);
     void work();
@@ -775,10 +776,8 @@ static std::shared_ptr<rpc_dispatcher> get_dispatcher(const std::string & endpoi
 
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
-    auto request = std::make_shared<rpc_msg_free_buffer_req>();
-    request->remote_ptr = ctx->remote_ptr;
-    LOG_DBG2("[%s] remote_ptr: 0x%" PRIx64 "\n", __func__, request->remote_ptr);
-    ctx->dispatcher->send(RPC_CMD_FREE_BUFFER, request, sizeof(*request));
+    LOG_DBG2("[%s] remote_ptr: 0x%" PRIx64 "\n", __func__, ctx->remote_ptr);
+    ctx->dispatcher->free_buffer(ctx->remote_ptr);
     delete ctx;
 }
 
@@ -1303,6 +1302,16 @@ static uint8_t * serialize_graph(uint32_t device, const ggml_cgraph * cgraph, co
     return output;
 }
 
+void rpc_dispatcher::free_buffer(uint64_t remote_ptr) {
+    auto request = std::make_shared<rpc_msg_free_buffer_req>();
+    request->remote_ptr = remote_ptr;
+    // the server discards its cached graphs when a buffer is freed; forget them here under the same lock,
+    // so that both sides clear at the same point in the message stream and a later recompute cannot miss
+    std::lock_guard<std::mutex> lock(graph_mutex);
+    graph_uids.clear();
+    send(RPC_CMD_FREE_BUFFER, request, sizeof(*request));
+}
+
 void rpc_dispatcher::graph_compute(uint32_t device, const ggml_cgraph * cgraph) {
     std::lock_guard<std::mutex> lock(graph_mutex);
     GGML_ASSERT(cgraph->n_nodes > 0);
@@ -1630,11 +1639,9 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
     }
     // Discard all cached graphs to avoid use-after-free in graph_recompute,
     // since their nodes may hold pointers to the buffer being freed. The client
-    // will have to re-serialize its graphs from now on.
+    // clears its graph uids at the same point, so the caches stay the same size.
     for (auto & sgs : stored_graphs) {
-        for (auto & sg : sgs) {
-            sg.second.graph = nullptr;
-        }
+        sgs.clear();
     }
     ggml_backend_buffer_free(buffer);
     buffers.erase(buffer);
